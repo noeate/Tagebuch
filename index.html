@@ -333,6 +333,7 @@ button{font:inherit;color:inherit;background:none;border:none;cursor:pointer}
       <button id="t-verse">Bibelverse</button>
       <button id="t-remind">Erinnerung</button>
       <button id="t-backup">Sichern &amp; laden</button>
+      <button id="t-sync">Geräte</button>
     </div>
     <div id="panels"></div>
     <div id="storage-warning"></div>
@@ -526,7 +527,7 @@ var DEFAULT_VERSE2 = {
   ref:"Psalm 139,23\u201324"
 };
 
-var db = { verse:{text:"",ref:""}, verse2:{text:"",ref:""}, entries:{}, reviews:{}, reminder:false, lastNotify:"" };
+var db = { verse:{text:"",ref:""}, verse2:{text:"",ref:""}, verseAt:0, entries:{}, reviews:{}, reminder:false, lastNotify:"" };
 var storageWorks = true;
 
 function load(){
@@ -536,6 +537,7 @@ function load(){
       var p = JSON.parse(raw);
       if(p && typeof p === "object"){
         if(p.verse) db.verse = p.verse;
+        if(typeof p.verseAt === "number") db.verseAt = p.verseAt;
         if(p.verse2) db.verse2 = p.verse2;
         if(p.entries) db.entries = p.entries;
         if(p.reviews) db.reviews = p.reviews;
@@ -561,6 +563,146 @@ function migrate(entries){
 function save(){
   try{ window.localStorage.setItem(STORE_KEY, JSON.stringify(db)); }
   catch(e){ storageWorks = false; renderStorageWarning(); }
+  if(typeof schedulePush === "function") schedulePush();
+}
+
+/* ---------------- Abgleich zwischen Geräten ---------------- */
+var SYNC_KEY  = "tagebuch.sync";
+var SYNC_APP  = "tagebuch";
+var SYNC_URL_DEFAULT = "https://gebet-sync.noelatesgmx-de.workers.dev/";
+var sync = loadSync();
+var syncMsg = "", syncBusy = false, pushTimer = null, lastPush = 0;
+
+function loadSync(){
+  try{
+    var raw = window.localStorage.getItem(SYNC_KEY);
+    if(raw){
+      var o = JSON.parse(raw);
+      if(o && typeof o === "object"){
+        return {url:o.url||SYNC_URL_DEFAULT, token:o.token||"", on:!!o.on, last:o.last||0};
+      }
+    }
+  }catch(e){}
+  return {url:SYNC_URL_DEFAULT, token:"", on:false, last:0};
+}
+function saveSync(){
+  try{ window.localStorage.setItem(SYNC_KEY, JSON.stringify(sync)); }catch(e){}
+}
+function syncEndpoint(){
+  return String(sync.url||"").replace(/\/+$/,"") + "/?app=" + SYNC_APP;
+}
+function clockNow(){
+  var d = new Date();
+  return String(d.getHours()).padStart(2,"0")+":"+String(d.getMinutes()).padStart(2,"0");
+}
+function weightOf(o){
+  var n = 0;
+  if(!o || typeof o !== "object") return 0;
+  Object.keys(o).forEach(function(k){
+    var v = o[k];
+    if(typeof v === "string") n += v.trim().length;
+    else if(v && typeof v === "object") n += weightOf(v) + Object.keys(v).length;
+  });
+  return n;
+}
+/* Neuerer Stand gewinnt; ohne Zeitstempel der inhaltsreichere. */
+function pickNewer(mine, theirs){
+  var mu = (mine && typeof mine.u === "number") ? mine.u : 0;
+  var tu = (theirs && typeof theirs.u === "number") ? theirs.u : 0;
+  if(tu > mu) return theirs;
+  if(mu > tu) return mine;
+  return weightOf(theirs) > weightOf(mine) ? theirs : mine;
+}
+function mergeBucket(mineBag, theirsBag){
+  var changed = false;
+  Object.keys(theirsBag || {}).forEach(function(k){
+    if(!/^\d{4}-\d{2}-\d{2}$/.test(k)) return;
+    var theirs = theirsBag[k];
+    if(!theirs || typeof theirs !== "object") return;
+    if(!mineBag[k]){ mineBag[k] = theirs; changed = true; return; }
+    var winner = pickNewer(mineBag[k], theirs);
+    if(winner !== mineBag[k]){ mineBag[k] = winner; changed = true; }
+  });
+  return changed;
+}
+function mergeRemote(remote){
+  if(!remote || typeof remote !== "object") return false;
+  var changed = false;
+  if(mergeBucket(db.entries, remote.entries)) changed = true;
+  if(mergeBucket(db.reviews, remote.reviews)) changed = true;
+  var ra = typeof remote.verseAt === "number" ? remote.verseAt : 0;
+  var la = typeof db.verseAt === "number" ? db.verseAt : 0;
+  if(ra > la && remote.verse && (remote.verse.text||"").trim()){
+    db.verse  = remote.verse;
+    if(remote.verse2) db.verse2 = remote.verse2;
+    db.verseAt = ra;
+    changed = true;
+  }
+  if(changed) migrate(db.entries);
+  return changed;
+}
+function syncNow(quiet){
+  if(!sync.on || !sync.url || !sync.token) return;
+  if(syncBusy) return;
+  if(typeof fetch !== "function"){ syncMsg = "Dieser Browser kann nicht abgleichen."; refreshSyncPanel(); return; }
+  syncBusy = true;
+  lastPush = Date.now();
+  if(!quiet){ syncMsg = "Abgleich läuft …"; refreshSyncPanel(); }
+  var url = syncEndpoint();
+  fetch(url, {headers:{"X-Token": sync.token}})
+    .then(function(r){
+      if(r.status === 401) throw new Error("Kennwort stimmt nicht.");
+      if(!r.ok) throw new Error("Fehler " + r.status);
+      return r.json();
+    })
+    .then(function(res){
+      var changed = mergeRemote(res && res.data);
+      save();
+      if(changed){
+        try{ renderHome(); renderEntryVerse(); }catch(e){}
+      }
+      return fetch(url, {
+        method:"POST",
+        headers:{"X-Token": sync.token, "Content-Type":"application/json"},
+        body: JSON.stringify(db)
+      });
+    })
+    .then(function(r){
+      if(!r.ok) throw new Error("Speichern fehlgeschlagen (" + r.status + ")");
+      sync.last = Date.now(); saveSync();
+      syncBusy = false;
+      syncMsg = "Abgeglichen um " + clockNow() + ".";
+      refreshSyncPanel();
+    })
+    .catch(function(e){
+      syncBusy = false;
+      syncMsg = "Abgleich fehlgeschlagen – " + ((e && e.message) || "unbekannter Fehler");
+      refreshSyncPanel();
+    });
+}
+function schedulePush(){
+  if(!sync.on || !sync.token) return;
+  if(Date.now() - lastPush > 120000){ syncNow(true); return; }
+  if(pushTimer) clearTimeout(pushTimer);
+  pushTimer = setTimeout(function(){ pushTimer = null; syncNow(true); }, 8000);
+}
+function pushNow(){
+  if(!sync.on || !sync.token || typeof fetch !== "function") return;
+  try{
+    fetch(syncEndpoint(), {
+      method:"POST",
+      headers:{"X-Token": sync.token, "Content-Type":"application/json"},
+      body: JSON.stringify(db),
+      keepalive: true
+    });
+  }catch(e){}
+}
+function refreshSyncPanel(){
+  if(typeof openPanelName === "undefined" || openPanelName !== "sync") return;
+  var host = document.getElementById("panels");
+  if(!host) return;
+  host.innerHTML = "";
+  host.appendChild(syncPanel());
 }
 
 /* Datum */
@@ -631,7 +773,7 @@ function isEmpty(e){
   var c=CHECKS.some(function(x){ return e.checks[x.id]==="yes" || e.checks[x.id]==="no"; });
   return !t && !c;
 }
-function putEntry(k,e){ if(isEmpty(e)) delete db.entries[k]; else db.entries[k]=e; }
+function putEntry(k,e){ if(isEmpty(e)) delete db.entries[k]; else { e.u = Date.now(); db.entries[k]=e; } }
 function sortedKeys(){
   return Object.keys(db.entries).filter(function(k){ return !isEmpty(getEntry(k)); }).sort().reverse();
 }
@@ -674,7 +816,7 @@ function isReviewEmpty(r){
   Object.keys(r.open).forEach(function(k){ if(r.open[k]) anyOpen=true; });
   return !anyOpen;
 }
-function putReview(k,r){ if(isReviewEmpty(r)) delete db.reviews[k]; else db.reviews[k]=r; }
+function putReview(k,r){ if(isReviewEmpty(r)) delete db.reviews[k]; else { r.u = Date.now(); db.reviews[k]=r; } }
 function sortedReviewKeys(){
   return Object.keys(db.reviews).filter(function(k){ return !isReviewEmpty(getReview(k)); }).sort().reverse();
 }
@@ -1417,6 +1559,7 @@ function openPanel(name){
   if(name==="verse")  host.appendChild(versePanel());
   if(name==="remind") host.appendChild(remindPanel());
   if(name==="backup") host.appendChild(backupPanel());
+  if(name==="sync")   host.appendChild(syncPanel());
   host.scrollIntoView({behavior:"smooth",block:"nearest"});
 }
 function panelShell(title,desc){
@@ -1445,6 +1588,7 @@ function versePanel(){
   ok.addEventListener("click",function(){
     db.verse.text=refs.verse.ta.value;   db.verse.ref=refs.verse.inp.value;
     db.verse2.text=refs.verse2.ta.value; db.verse2.ref=refs.verse2.inp.value;
+    db.verseAt = Date.now();
     save(); renderHome(); renderEntryVerse(); openPanel("verse");
   });
   row.appendChild(ok); p.appendChild(row);
@@ -1481,6 +1625,47 @@ function remindPanel(){
   p.appendChild(status); p.appendChild(row);
   return p;
 }
+function syncPanel(){
+  var p=panelShell("Geräte abgleichen",
+    "Deine Einträge liegen dann zusätzlich in deinem eigenen Speicher im Netz, und jedes Gerät mit demselben Kennwort sieht denselben Stand. Bei einem Tag, den zwei Geräte kennen, gewinnt der neuere Eintrag.");
+
+  p.appendChild(el("label",null,"Adresse des Dienstes"));
+  var u=document.createElement("input");
+  u.type="url"; u.value=sync.url||""; u.placeholder="https://…";
+  p.appendChild(u);
+
+  p.appendChild(el("label",null,"Kennwort"));
+  var t=document.createElement("input");
+  t.type="password"; t.value=sync.token||""; t.autocomplete="off";
+  p.appendChild(t);
+
+  var row=el("div","row");
+  var go=el("button","btn-s", sync.on ? "Jetzt abgleichen" : "Verbinden");
+  go.addEventListener("click",function(){
+    sync.url=u.value.trim(); sync.token=t.value;
+    if(!sync.url || !sync.token){
+      syncMsg="Bitte Adresse und Kennwort eintragen."; saveSync(); refreshSyncPanel(); return;
+    }
+    sync.on=true; saveSync(); syncNow(false);
+  });
+  row.appendChild(go);
+
+  if(sync.on){
+    var off=el("button","btn-s ghost","Trennen");
+    off.addEventListener("click",function(){
+      sync.on=false; saveSync();
+      syncMsg="Getrennt. Die Einträge auf diesem Gerät bleiben erhalten.";
+      refreshSyncPanel();
+    });
+    row.appendChild(off);
+  }
+  p.appendChild(row);
+
+  var msg=el("p","sep", syncMsg || (sync.on ? "Verbunden." : "Nicht verbunden – die Einträge bleiben nur auf diesem Gerät."));
+  p.appendChild(msg);
+  return p;
+}
+
 function backupPanel(){
   var p=panelShell("Sichern & laden",
     "Die Sicherung enthält Tageseinträge, Rechenschaften, Bewertungen und beide Verse. Lade sie ab und zu herunter und leg sie irgendwo ab, wo du sie wiederfindest.");
@@ -1592,17 +1777,27 @@ document.getElementById("rl-back").addEventListener("click",toHome);
 document.getElementById("t-verse").addEventListener("click",function(){ openPanel("verse"); });
 document.getElementById("t-remind").addEventListener("click",function(){ openPanel("remind"); });
 document.getElementById("t-backup").addEventListener("click",function(){ openPanel("backup"); });
+document.getElementById("t-sync").addEventListener("click",function(){ openPanel("sync"); });
 
 window.addEventListener("beforeunload",function(){
-  clearTimeout(saveTimer); clearTimeout(reviewTimer); clearTimeout(thinkTimer); save();
+  clearTimeout(saveTimer); clearTimeout(reviewTimer); clearTimeout(thinkTimer); save(); pushNow();
+});
+window.addEventListener("pagehide",function(){
+  clearTimeout(saveTimer); clearTimeout(reviewTimer); clearTimeout(thinkTimer); save(); pushNow();
 });
 document.addEventListener("visibilitychange",function(){
-  if(document.hidden){ clearTimeout(saveTimer); clearTimeout(reviewTimer); clearTimeout(thinkTimer); save(); }
+  if(document.hidden){
+    clearTimeout(saveTimer); clearTimeout(reviewTimer); clearTimeout(thinkTimer);
+    save(); pushNow();
+  } else if(sync.on){
+    syncNow(true);
+  }
 });
 
 load();
 renderHome();
 show("home");
+if(sync.on) syncNow(true);
 setInterval(checkReminder,40000);
 checkReminder();
 
