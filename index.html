@@ -280,6 +280,15 @@ button{font:inherit;color:inherit;background:none;border:none;cursor:pointer}
 .pickday input{background:var(--night-2);color:var(--bone);border:1px solid rgba(228,220,203,.2);
   border-radius:6px;padding:.45rem .6rem;font:inherit;font-size:.9rem;color-scheme:dark;margin-left:auto}
 
+.pickday .btn-s{flex:none}
+.list-filter{display:flex;gap:.5rem;margin:0 0 1rem}
+.filter-btn{background:none;border:1px solid rgba(228,220,203,.2);color:var(--bone-dim);
+  border-radius:999px;padding:.35rem .9rem;font:inherit;font-size:.82rem;cursor:pointer}
+.filter-btn.on{border-color:var(--brass-lit);color:var(--brass-lit)}
+.day-empty{opacity:.62}
+.day-empty .day-date{color:var(--bone-dim)}
+.day-none{font-style:italic;color:var(--bone-dim)}
+
 /* Verlauf */
 .tr-sec{margin-bottom:2.6rem}
 .tr-weeks{display:flex;gap:3px;margin-left:auto;flex:none}
@@ -389,6 +398,7 @@ button{font:inherit;color:inherit;background:none;border:none;cursor:pointer}
     <div class="pickday">
       <label for="l-date">Anderen Tag öffnen</label>
       <input type="date" id="l-date">
+      <button class="btn-s" id="l-open" type="button">Öffnen</button>
     </div>
     <p class="summary" id="l-summary"></p>
     <div id="l-days"></div>
@@ -1469,44 +1479,80 @@ function renderTrend(){
 }
 
 /* ---------------- Listen ---------------- */
+var listMode = "all";   /* "all" = jeder Tag, "filled" = nur Tage mit Eintrag */
+
+function ymdBack(days){
+  var d = new Date(); d.setHours(0,0,0,0); d.setDate(d.getDate()-days);
+  return ymd(d);
+}
+/* Jeder Tag von heute zurueck bis zum aeltesten Eintrag, mindestens 30 Tage. */
+function allDayKeys(filled){
+  var oldest = filled.length ? filled[filled.length-1] : todayKey();
+  var start  = ymdBack(29);
+  if(oldest < start) start = oldest;
+  var out = [], guard = 0, d = new Date();
+  d.setHours(0,0,0,0);
+  while(ymd(d) >= start && guard++ < 1200){
+    out.push(ymd(d));
+    d.setDate(d.getDate()-1);
+  }
+  return out;
+}
+
+function dayButton(k){
+  var e = getEntry(k), leer = isEmpty(e);
+  var b = el("button","day"+(leer?" day-empty":"")), top = el("div","day-top");
+  top.appendChild(el("span","day-date",relDate(k)));
+  var dots = el("span","dots");
+  CHECKS.forEach(function(c){
+    var i = document.createElement("i"), v = e.checks[c.id];
+    if(v==="yes"){ i.className="d-yes"; i.title=c.label+": ja"; }
+    else if(v==="no"){ i.className="d-no"; i.title=c.label+": nein"; }
+    else i.title=c.label+": offen";
+    dots.appendChild(i);
+  });
+  top.appendChild(dots);
+  b.appendChild(top);
+  var snip = "";
+  for(var i=0;i<FIELDS.length;i++){
+    var v = (e[FIELDS[i].id]||"").trim();
+    if(v){ snip = v; break; }
+  }
+  if(snip) b.appendChild(el("p","day-snip",snip));
+  else if(leer) b.appendChild(el("p","day-snip day-none","Nichts eingetragen \u2013 zum Nachtragen tippen"));
+  b.addEventListener("click",function(){ openEntry(k); });
+  return b;
+}
+
 function renderList(){
-  var keys=sortedKeys();
-  var wrap=document.getElementById("l-days"), sum=document.getElementById("l-summary");
-  var picker=document.getElementById("l-date");
-  picker.max=todayKey();
-  picker.value="";
-  wrap.innerHTML="";
-  if(!keys.length){
-    sum.textContent="";
+  var filled = sortedKeys();
+  var wrap = document.getElementById("l-days"), sum = document.getElementById("l-summary");
+  var picker = document.getElementById("l-date");
+  picker.max = todayKey();
+  if(!picker.value) picker.value = todayKey();
+  wrap.innerHTML = "";
+
+  var parts = [filled.length + (filled.length===1 ? " Eintrag" : " Einträge")];
+  var st = streak(filled);
+  if(st>=2) parts.push(st+" Tage in Folge");
+  sum.textContent = filled.length ? parts.join(", ") : "";
+
+  var toggle = el("div","list-filter");
+  [["all","Alle Tage"],["filled","Nur mit Eintrag"]].forEach(function(o){
+    var t = el("button","filter-btn"+(listMode===o[0]?" on":""), o[1]);
+    t.type = "button";
+    t.addEventListener("click",function(){ listMode = o[0]; renderList(); });
+    toggle.appendChild(t);
+  });
+  wrap.appendChild(toggle);
+
+  var list = listMode==="all" ? allDayKeys(filled) : filled;
+
+  if(!list.length){
     wrap.appendChild(el("p","list-empty","Noch keine Einträge. Fang mit dem heutigen Tag an \u2013 auch drei Zeilen zählen."));
     show("list"); return;
   }
-  var parts=[keys.length+(keys.length===1?" Eintrag":" Einträge")];
-  var st=streak(keys);
-  if(st>=2) parts.push(st+" Tage in Folge");
-  sum.textContent=parts.join(", ");
-
-  keys.forEach(function(k){
-    var e=getEntry(k), b=el("button","day"), top=el("div","day-top");
-    top.appendChild(el("span","day-date",relDate(k)));
-    var dots=el("span","dots");
-    CHECKS.forEach(function(c){
-      var i=document.createElement("i"), v=e.checks[c.id];
-      if(v==="yes"){ i.className="d-yes"; i.title=c.label+": ja"; }
-      else if(v==="no"){ i.className="d-no"; i.title=c.label+": nein"; }
-      else i.title=c.label+": offen";
-      dots.appendChild(i);
-    });
-    top.appendChild(dots); b.appendChild(top);
-    var snip="";
-    for(var i=0;i<FIELDS.length;i++){
-      var v=(e[FIELDS[i].id]||"").trim();
-      if(v){ snip=v; break; }
-    }
-    if(snip) b.appendChild(el("p","day-snip",snip));
-    b.addEventListener("click",function(){ openEntry(k); });
-    wrap.appendChild(b);
-  });
+  list.forEach(function(k){ wrap.appendChild(dayButton(k)); });
   show("list");
 }
 
@@ -1759,12 +1805,14 @@ function toHome(){
 document.getElementById("btn-today").addEventListener("click",function(){ openEntry(todayKey()); });
 document.getElementById("btn-review").addEventListener("click",function(){ openReview(currentSundayKey()); });
 document.getElementById("btn-list").addEventListener("click",renderList);
-document.getElementById("l-date").addEventListener("change",function(){
-  var v=this.value;
-  if(!/^\d{4}-\d{2}-\d{2}$/.test(v)) return;
-  if(v>todayKey()){ this.value=""; return; }
+function openPickedDay(){
+  var f=document.getElementById("l-date"), v=f && f.value;
+  if(!/^\d{4}-\d{2}-\d{2}$/.test(v)){ if(f) f.focus(); return; }
+  if(v>todayKey()){ f.value=todayKey(); return; }
   openEntry(v);
-});
+}
+document.getElementById("l-date").addEventListener("change",openPickedDay);
+document.getElementById("l-open").addEventListener("click",openPickedDay);
 document.getElementById("btn-reviewlist").addEventListener("click",renderReviewList);
 document.getElementById("rl-trend").addEventListener("click",renderTrend);
 document.getElementById("tr-back").addEventListener("click",renderReviewList);

@@ -1,7 +1,7 @@
 /* Hält die App offline verfügbar. Persönliche Einträge liegen ausschließlich
    im localStorage des Geräts; der Abgleich läuft am Cache vorbei. */
 
-var CACHE = "tagebuch-2026-09-15-sync";
+var CACHE = "tagebuch-2026-10-07-liste";
 var ASSETS = [
   "./",
   "./index.html",
